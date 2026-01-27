@@ -32,7 +32,7 @@ echo "Writing ${NUMFILES} files containing string ${WRITESTR} to ${WRITEDIR}"
 rm -rf "${WRITEDIR}"
 
 # create $WRITEDIR if not assignment1
-assignment=`cat ../conf/assignment.txt`
+assignment=`cat conf/assignment.txt` # modified from ../conf/assignment.txt for assignment 3 part
 
 if [ $assignment != 'assignment1' ]
 then
@@ -56,6 +56,8 @@ for i in $( seq 1 $NUMFILES)
 do
 	./writer "$WRITEDIR/${username}$i.txt" "$WRITESTR"
 done
+
+pwd
 
 OUTPUTSTRING=$(./finder.sh "$WRITEDIR" "$WRITESTR")
 

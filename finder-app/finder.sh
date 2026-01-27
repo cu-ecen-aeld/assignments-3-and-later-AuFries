@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # Provides the number of files and lines that match a particular string
 # Parameters:
 # filesdir - the directory to search
