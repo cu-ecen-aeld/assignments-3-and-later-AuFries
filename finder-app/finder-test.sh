@@ -1,4 +1,5 @@
 #!/bin/sh
+PATH=$PATH:/bin/finder-app
 # Tester script for assignment 1 and assignment 2
 # Author: Siddhant Jajoo
 
@@ -8,7 +9,24 @@ set -u
 NUMFILES=10
 WRITESTR=AELD_IS_FUN
 WRITEDIR=/tmp/aeld-data
-username=$(cat conf/username.txt)
+
+# Determine script directory and config directory. Default config dir is
+# /etc/finder-app/conf to allow running this script from /usr/bin. Change by setting FINDER_APP_CONF
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONF_DIR="/etc/finder-app/conf"
+if [ -n "${FINDER_APP_CONF:-}" ]; then
+	CONF_DIR="$FINDER_APP_CONF"
+fi
+if [ ! -d "$CONF_DIR" ]; then
+	if [ -d "$SCRIPT_DIR/conf" ]; then
+		CONF_DIR="$SCRIPT_DIR/conf"
+	else
+		echo "Config directory not found at $CONF_DIR or $SCRIPT_DIR/conf" >&2
+		exit 1
+	fi
+fi
+
+username=$(cat "$CONF_DIR/username.txt")
 
 if [ $# -lt 3 ]
 then
@@ -32,7 +50,7 @@ echo "Writing ${NUMFILES} files containing string ${WRITESTR} to ${WRITEDIR}"
 rm -rf "${WRITEDIR}"
 
 # create $WRITEDIR if not assignment1
-assignment=`cat conf/assignment.txt` # modified from ../conf/assignment.txt for assignment 3 part
+assignment=$(cat "$CONF_DIR/assignment.txt") # modified from ../conf/assignment.txt for assignment 3 part
 
 if [ $assignment != 'assignment1' ]
 then
@@ -54,12 +72,25 @@ fi
 
 for i in $( seq 1 $NUMFILES)
 do
-	./writer "$WRITEDIR/${username}$i.txt" "$WRITESTR"
+	if ! command -v writer >/dev/null 2>&1; then
+		echo "writer executable not found in PATH" >&2
+		exit 1
+	fi
+	writer "$WRITEDIR/${username}$i.txt" "$WRITESTR"
 done
+
 
 pwd
 
-OUTPUTSTRING=$(./finder.sh "$WRITEDIR" "$WRITESTR")
+if ! command -v finder.sh >/dev/null 2>&1; then
+	echo "finder.sh executable not found in PATH" >&2
+	exit 1
+fi
+
+OUTPUTSTRING=$(finder.sh "$WRITEDIR" "$WRITESTR")
+
+# Save the output for assignment 4 verification
+echo "$OUTPUTSTRING" > /tmp/assignment4-result.txt
 
 # remove temporary directories
 rm -rf /tmp/aeld-data
