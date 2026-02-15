@@ -6,7 +6,7 @@ Use this command to view streamed syslog messages:
 journalctl -f -t aesdsocket
 
 To test the server, you can use netcat in a separate terminal:
-nc localhost 9000
+nc -q 0 localhost 9000
 
 TODO: accept multiple simultaneous connections
 */
@@ -32,13 +32,14 @@ TODO: accept multiple simultaneous connections
 #define DATA_PATH "/var/tmp/aesdsocketdata"
 #define RECEIVE_SIZE 4096
 #define SEND_SIZE 4096
-#define PACKET_DELIM_CHAR "\n"
+#define PACKET_DELIM_CH '\n'
 
 typedef struct {
-    int fd;                             // fd of connected client
+    int fd;                                  // fd of connected client
     struct sockaddr_storage addr;            // Interchangeable for IPv4 & IPv6
     socklen_t addr_len;                      // Length of socket address
     char conaddr_str[INET6_ADDRSTRLEN + 16]; // "IPv4: <addr>:<port>" or "IPv6: [<addr>]:<port>"
+    size_t bytes_received;
 } conn_info_t;
 
 typedef struct {
@@ -60,11 +61,16 @@ static int setup_server_socket(const char *port);
 static int accept_client_connection(int sock_fd, conn_info_t *client_info);
 static void skeleton_daemon();
 static void str_sockaddr(conn_info_t *client_info);
+static int socket_receive_packets(int data_fd, int sock_fd, dyn_buffer_t *recv_buf, size_t *total_bytes);
 static int socket_send_file(int sock_fd, int file_fd);
+static int file_append_packets(int fd, dyn_buffer_t *dyn_buf, const char delim_ch);
+static void free_dyn_buffer(dyn_buffer_t *dyn_buf);
+static void redirect_stdio_to_devnull(void);
+
 
 int main(int argc, char *argv[]) {
 
-    conn_info_t client_info = {.fd = -1};
+    conn_info_t client_info;
     int sock_fd, data_fd;
 
     // Setup signal handler for program exit
@@ -83,7 +89,7 @@ int main(int argc, char *argv[]) {
     if (isdaemon) {
         skeleton_daemon();
         printf("Running server as daemon with PID %d\n", getpid());
-        syslog(LOG_INFO, "Running server as daemon with PID %d", getpid());
+        syslog(LOG_INFO, "Running server as daemon");
     }
 
     // Open save data file
@@ -93,24 +99,29 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
     while (!exit_requested) {
-        accept_client_connection(sock_fd, &client_info); // Receive new socket for pending connection
+        if (accept_client_connection(sock_fd, &client_info) < 0) { // Receive new socket for pending connection
+            perror("accept");
+            break;
+        }
         str_sockaddr(&client_info); // Set client connection string
         printf("Accepted connection from %s\n", client_info.conaddr_str);
         syslog(LOG_INFO, "Accepted connection from %s", client_info.conaddr_str);
         
         dyn_buffer_t recv_buf = {0};
-        socket_receive_packets(client_info.fd, &recv_buf);
-        file_append_packets(data_fd, &recv_buf, PACKET_DELIM_CHAR);
+        socket_receive_packets(data_fd, client_info.fd, &recv_buf, &client_info.bytes_received);
+        printf("Received %d total bytes from client\n", client_info.bytes_received);
+        syslog(LOG_INFO, "Received %d total bytes from client", client_info.bytes_received);
+
         free_dyn_buffer(&recv_buf);
 
         socket_send_file(client_info.fd, data_fd); // Return full content of saved data to client
+
+        close(client_info.fd);
+        printf("Closed connection from %s\n", client_info.conaddr_str);
+        syslog(LOG_INFO, "Closed connection from %s", client_info.conaddr_str);
     }
 
-    printf("Closed connection from %s\n", client_info.conaddr_str);
-    syslog(LOG_INFO, "Closed connection from %s", client_info.conaddr_str);
-
     close(sock_fd);
-    close(client_info.fd);
     close(data_fd);
     remove(DATA_PATH);
     closelog();
@@ -118,7 +129,7 @@ int main(int argc, char *argv[]) {
     return EXIT_SUCCESS;
 }
 
-static void free_dyn_buf(dyn_buffer_t *dyn_buf) {
+static void free_dyn_buffer(dyn_buffer_t *dyn_buf) {
     if (!dyn_buf) {
         return;
     }
@@ -136,11 +147,37 @@ static void free_dyn_buf(dyn_buffer_t *dyn_buf) {
  * @param dyn_buf The dynamic buffer to write to the file
  * @param delim_ch The delimeter character which separates packets
  *
+ * @return Number of packets appended to file
  */
-static void file_append_packets(int fd, dyn_buffer_t *dyn_buf, const char delim_ch) {
-    write()
-}
+static int file_append_packets(int fd, dyn_buffer_t *dyn_buf, const char delim_ch) {
+    int packet_count = 0;
+    size_t start = 0;
+    for (size_t i = 0; i < dyn_buf->len; i++) {
 
+        if (dyn_buf->data[i] == delim_ch) {
+            size_t packet_len = i - start + 1; // include newline
+
+            printf("Wrote %d bytes to data file\n", packet_len);
+            syslog(LOG_INFO, "Wrote %d bytes to data file", packet_len);
+            ssize_t written = write(fd, dyn_buf->data + start, packet_len);
+
+            if (written != (ssize_t)packet_len) {
+                return -1;
+            }
+
+            start = i + 1;
+            packet_count += 1;
+        }
+    }
+
+    if (start > 0) {
+        memmove(dyn_buf->data, dyn_buf->data + start, dyn_buf->len - start);
+
+        dyn_buf->len -= start;
+    }
+
+    return packet_count;
+}
 
 static int append_to_dynamic_buffer(dyn_buffer_t *dyn_buf, char *append_data, size_t append_len) {
     size_t new_capacity = dyn_buf->capacity + append_len;
@@ -161,16 +198,46 @@ static int append_to_dynamic_buffer(dyn_buffer_t *dyn_buf, char *append_data, si
     return 0;
 }
 
-static int socket_receive_packets(int sock_fd, dyn_buffer_t *recv_buf) {
+static int socket_receive_packets(int data_fd, int sock_fd, dyn_buffer_t *recv_buf, size_t *total_bytes) {
     char chunk_buf[RECEIVE_SIZE];
     ssize_t bytes_read;
 
-    while((bytes_read = recv(sock_fd, chunk_buf, sizeof(chunk_buf), 0)) > 0) {
-        append_to_dynamic_buffer(recv_buf, chunk_buf, bytes_read);
-        if (bytes_read == 0) {
-            // Client closed connection (HANDLE)
+    while (1) {
+        bytes_read = recv(sock_fd, chunk_buf, sizeof(chunk_buf), 0);
+
+        if (bytes_read > 0) {
+
+            if (append_to_dynamic_buffer(recv_buf, chunk_buf, bytes_read) < 0) {
+                return -1;
+            }
+
+            int packets_written = 
+                file_append_packets(data_fd, recv_buf, PACKET_DELIM_CH);
+
+            if (packets_written < 0) {
+                return -1;
+            }
+
+            if (packets_written > 0) {
+                *total_bytes = bytes_read;
+                printf("Received %d packets\n", packets_written);
+                break;   // at least one newline processed
+            }
+        }
+        else if (bytes_read == 0) { // Client closed connection
+            if (recv_buf->len > 0) {
+                // Write remaining partial packet
+                if (write(data_fd, recv_buf->data, recv_buf->len) != recv_buf->len)
+                    return -1;
+            }
+            break;
+        }
+        else {
+            perror("recv");
+            return -1;
         }
     }
+    return 0;
 }
 
 static int accept_client_connection(int sock_fd, conn_info_t *client_info) {
@@ -183,6 +250,7 @@ static int accept_client_connection(int sock_fd, conn_info_t *client_info) {
     }
 
     client_info->fd = client_fd;
+    client_info->bytes_received = 0;
     return client_fd;
 }
 
@@ -275,6 +343,10 @@ static int socket_send_file(int sock_fd, int file_fd) {
         ssize_t total_sent = 0;
         while (total_sent < bytes_read) {
             ssize_t bytes_sent = send(sock_fd, buf + total_sent, bytes_read - total_sent, 0);
+            if (bytes_sent < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
             total_sent += bytes_sent;
         }
     }
@@ -304,7 +376,8 @@ static void skeleton_daemon()
         perror("setsid");
         exit(EXIT_FAILURE);
     }
-    
+
+    redirect_stdio_to_devnull();
     umask(0);
     chdir("/");
 }
@@ -341,4 +414,21 @@ static void str_sockaddr(conn_info_t *client_info) {
         snprintf(client_info->conaddr_str, sizeof(client_info->conaddr_str), "%s: [%s]:%u", ipver, ipstr, port);
     else
         snprintf(client_info->conaddr_str, sizeof(client_info->conaddr_str), "%s: %s:%u", ipver, ipstr, port);
+}
+
+static void redirect_stdio_to_devnull(void)
+{
+    int fd = open("/dev/null", O_RDWR);
+    if (fd < 0) {
+        exit(EXIT_FAILURE);
+    }
+
+    // Redirect stdout, stderr
+    if (dup2(fd, STDOUT_FILENO) < 0) exit(EXIT_FAILURE);
+    if (dup2(fd, STDERR_FILENO) < 0) exit(EXIT_FAILURE);
+
+    // Close extra descriptor if it's not one of the standard ones
+    if (fd > STDERR_FILENO) {
+        close(fd);
+    }
 }
