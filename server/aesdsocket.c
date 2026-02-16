@@ -423,7 +423,8 @@ static void redirect_stdio_to_devnull(void)
         exit(EXIT_FAILURE);
     }
 
-    // Redirect stdout, stderr
+    // Redirect stin, stdout, stderr
+    if (dup2(fd, STDIN_FILENO) < 0) exit(EXIT_FAILURE);
     if (dup2(fd, STDOUT_FILENO) < 0) exit(EXIT_FAILURE);
     if (dup2(fd, STDERR_FILENO) < 0) exit(EXIT_FAILURE);
 
