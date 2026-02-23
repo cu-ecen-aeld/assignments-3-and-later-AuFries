@@ -59,7 +59,7 @@ typedef struct
     size_t capacity;
 } dyn_buffer_t;
 
-static int sock_fd, data_fd;
+static int sock_fd, data_fd = -1;
 static pthread_mutex_t datafile_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // Linked list contain TID, completion flag, and information for task completion
@@ -73,6 +73,22 @@ typedef struct thread_entry
 } thread_entry_t;
 
 SLIST_HEAD(slisthead, thread_entry);
+
+static void init_exit_signals();
+static void setup_server_socket(const char *port);
+static int accept_client_connection(conn_info_t *client_info);
+static void skeleton_daemon();
+static void str_sockaddr(conn_info_t *client_info);
+static int socket_receive_packets(int client_fd, dyn_buffer_t *recv_buf, size_t *total_bytes);
+static int socket_send_file(int client_fd);
+static int file_append_packets(int fd, dyn_buffer_t *dyn_buf, const char delim_ch);
+static void free_dyn_buffer(dyn_buffer_t *dyn_buf);
+static void redirect_stdio_to_devnull(void);
+static void queue_client_thread(struct slisthead *head, conn_info_t *client_info);
+static void *client_task(void *arg);
+static void join_complete_threads(struct slisthead *head);
+static void timestamp_timer_init(void);
+static int ensure_data_fd_open(void);
 
 static volatile sig_atomic_t exit_requested = 0;
 
@@ -98,24 +114,14 @@ static void timestamp_handler(union sigval sv)
     size_t len = strftime(buf, sizeof(buf),"timestamp:%a, %d %b %Y %H:%M:%S %z\n",&tm_info);
 
     pthread_mutex_lock(&datafile_lock);
+    if (ensure_data_fd_open() < 0) {
+        pthread_mutex_unlock(&datafile_lock);
+        return;
+    }
     write(data_fd, buf, len);
     pthread_mutex_unlock(&datafile_lock);
 }
 
-static void init_exit_signals();
-static int setup_server_socket(const char *port);
-static int accept_client_connection(int sock_fd, conn_info_t *client_info);
-static void skeleton_daemon();
-static void str_sockaddr(conn_info_t *client_info);
-static int socket_receive_packets(int data_fd, int sock_fd, dyn_buffer_t *recv_buf, size_t *total_bytes);
-static int socket_send_file(int sock_fd, int file_fd);
-static int file_append_packets(int fd, dyn_buffer_t *dyn_buf, const char delim_ch);
-static void free_dyn_buffer(dyn_buffer_t *dyn_buf);
-static void redirect_stdio_to_devnull(void);
-static void queue_client_thread(struct slisthead *head, conn_info_t *client_info);
-static void *client_task(void *arg);
-static void join_complete_threads(struct slisthead *head);
-static void timestamp_timer_init(void);
 
 int main(int argc, char *argv[])
 {
@@ -130,7 +136,7 @@ int main(int argc, char *argv[])
 
     openlog("aesdsocket", LOG_PID | LOG_CONS, LOG_USER);
 
-    sock_fd = setup_server_socket(PORT);
+    setup_server_socket(PORT);
 
     // Create server as a daemon
     if (isdaemon)
@@ -138,14 +144,6 @@ int main(int argc, char *argv[])
         skeleton_daemon();
         printf("Running server as daemon with PID %d\n", getpid());
         syslog(LOG_INFO, "Running server as daemon");
-    }
-
-    // Open save data file
-    data_fd = open(DATA_PATH, O_RDWR | O_CREAT | O_APPEND, 0644);
-    if (data_fd < 0)
-    {
-        perror("open");
-        exit(EXIT_FAILURE);
     }
 
     if (!USE_AESD_CHAR_DEVICE) {
@@ -159,7 +157,11 @@ int main(int argc, char *argv[])
     while (!exit_requested)
     {
         conn_info_t *client_info = malloc(sizeof(conn_info_t));
-        if (accept_client_connection(sock_fd, client_info) < 0)
+        if (!client_info) {
+            syslog(LOG_ERR, "malloc client_info failed");
+            break;
+        }
+        if (accept_client_connection(client_info) < 0)
         { // Receive new socket for pending connection
             perror("accept");
             free(client_info);
@@ -170,7 +172,9 @@ int main(int argc, char *argv[])
     }
 
     close(sock_fd);
-    close(data_fd);
+    if (data_fd >= 0) {
+        close(data_fd);
+    }
 #if !USE_AESD_CHAR_DEVICE
     remove(DATA_PATH);
 #endif
@@ -179,6 +183,24 @@ int main(int argc, char *argv[])
     return EXIT_SUCCESS;
 }
 
+static int ensure_data_fd_open(void)
+{
+    if (data_fd >= 0) {
+        return 0;
+    }
+
+#if USE_AESD_CHAR_DEVICE
+    data_fd = open(DATA_PATH, O_RDWR);
+#else
+    data_fd = open(DATA_PATH, O_RDWR | O_CREAT | O_APPEND, 0644);
+#endif
+
+    if (data_fd < 0) {
+        syslog(LOG_ERR, "open %s failed: %s", DATA_PATH, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
 
 static void timestamp_timer_init(void)
 {
@@ -249,14 +271,16 @@ static void *client_task(void *arg)
     syslog(LOG_INFO, "Accepted connection from %s", client_info->conaddr_str);
 
     dyn_buffer_t recv_buf = {0};
-    socket_receive_packets(data_fd, client_info->fd, &recv_buf, &client_info->bytes_received);
-    printf("Received %d total bytes from client\n", client_info->bytes_received);
-    syslog(LOG_INFO, "Received %d total bytes from client", client_info->bytes_received);
+    socket_receive_packets(client_info->fd, &recv_buf, &client_info->bytes_received);
+    printf("Received %zu total bytes from client\n", client_info->bytes_received);
+    syslog(LOG_INFO, "Received %zu total bytes from client", client_info->bytes_received);
 
     free_dyn_buffer(&recv_buf);
 
     pthread_mutex_lock(&datafile_lock);
-    socket_send_file(client_info->fd, data_fd); // Return full content of saved data to client
+    if (ensure_data_fd_open() == 0) {
+        (void)socket_send_file(client_info->fd);
+    }
     pthread_mutex_unlock(&datafile_lock);
 
     close(client_info->fd);
@@ -264,6 +288,7 @@ static void *client_task(void *arg)
     syslog(LOG_INFO, "Closed connection from %s", client_info->conaddr_str);
 
     entry->complete_flag = true;
+    return NULL;
 }
 
 static void free_dyn_buffer(dyn_buffer_t *dyn_buf)
@@ -299,8 +324,8 @@ static int file_append_packets(int fd, dyn_buffer_t *dyn_buf, const char delim_c
         {
             size_t packet_len = i - start + 1; // include newline
 
-            printf("Wrote %d bytes to data file\n", packet_len);
-            syslog(LOG_INFO, "Wrote %d bytes to data file", packet_len);
+            printf("Wrote %zu bytes to data file\n", packet_len);
+            syslog(LOG_INFO, "Wrote %zu bytes to data file", packet_len);
             ssize_t written = write(fd, dyn_buf->data + start, packet_len);
 
             if (written != (ssize_t)packet_len)
@@ -344,24 +369,29 @@ static int append_to_dynamic_buffer(dyn_buffer_t *dyn_buf, char *append_data, si
     return 0;
 }
 
-static int socket_receive_packets(int data_fd, int sock_fd, dyn_buffer_t *recv_buf, size_t *total_bytes)
+static int socket_receive_packets(int client_fd, dyn_buffer_t *recv_buf, size_t *total_bytes)
 {
     char chunk_buf[RECEIVE_SIZE];
     ssize_t bytes_read;
 
     while (1)
     {
-        bytes_read = recv(sock_fd, chunk_buf, sizeof(chunk_buf), 0);
+        bytes_read = recv(client_fd, chunk_buf, sizeof(chunk_buf), 0);
 
         if (bytes_read > 0)
         {
-
+            *total_bytes += (size_t)bytes_read;
+            
             if (append_to_dynamic_buffer(recv_buf, chunk_buf, bytes_read) < 0)
             {
                 return -1;
             }
 
             pthread_mutex_lock(&datafile_lock);
+            if (ensure_data_fd_open() < 0) {
+                pthread_mutex_unlock(&datafile_lock);
+                return -1;
+            }
             int packets_written = file_append_packets(data_fd, recv_buf, PACKET_DELIM_CH);
             pthread_mutex_unlock(&datafile_lock);
 
@@ -372,7 +402,6 @@ static int socket_receive_packets(int data_fd, int sock_fd, dyn_buffer_t *recv_b
 
             if (packets_written > 0)
             {
-                *total_bytes = bytes_read;
                 printf("Received %d packets\n", packets_written);
                 break; // at least one newline processed
             }
@@ -381,9 +410,17 @@ static int socket_receive_packets(int data_fd, int sock_fd, dyn_buffer_t *recv_b
         { // Client closed connection
             if (recv_buf->len > 0)
             {
-                // Write remaining partial packet
-                if (write(data_fd, recv_buf->data, recv_buf->len) != recv_buf->len)
+                pthread_mutex_lock(&datafile_lock);
+                if (ensure_data_fd_open() < 0) {
+                    pthread_mutex_unlock(&datafile_lock);
                     return -1;
+                }
+                // Write remaining partial packet
+                if (write(data_fd, recv_buf->data, recv_buf->len) != (ssize_t)recv_buf->len) {
+                    pthread_mutex_unlock(&datafile_lock);
+                    return -1;
+                }
+                pthread_mutex_unlock(&datafile_lock);
             }
             break;
         }
@@ -396,7 +433,7 @@ static int socket_receive_packets(int data_fd, int sock_fd, dyn_buffer_t *recv_b
     return 0;
 }
 
-static int accept_client_connection(int sock_fd, conn_info_t *client_info)
+static int accept_client_connection(conn_info_t *client_info)
 {
     client_info->addr_len = sizeof(client_info->addr);
 
@@ -412,10 +449,9 @@ static int accept_client_connection(int sock_fd, conn_info_t *client_info)
     return client_fd;
 }
 
-static int setup_server_socket(const char *port)
+static void setup_server_socket(const char *port)
 {
     struct addrinfo hints, *servinfo;
-    int sock_fd;
     int ret = 0;
 
     memset(&hints, 0, sizeof(hints));
@@ -471,7 +507,6 @@ static int setup_server_socket(const char *port)
         close(sock_fd);
         exit(EXIT_FAILURE);
     }
-    return sock_fd;
 }
 
 /**
@@ -492,27 +527,28 @@ static void init_exit_signals()
 /**
  * @brief Write full contents of a file to a socket until completion in chunks of SEND_SIZE
  *
- * @param sock_fd fd of the socket to write to
- * @param file_fd fd of the file to send
+ * @param client_fd fd of the socket to write to
  *
  * @return 0 on sucess and -1 on error
  */
-static int socket_send_file(int sock_fd, int file_fd)
+static int socket_send_file(int client_fd)
 {
     char buf[SEND_SIZE];
     ssize_t bytes_read = 0;
 
-    if (lseek(file_fd, 0, SEEK_SET) == -1)
+#if !USE_AESD_CHAR_DEVICE
+    if (lseek(data_fd, 0, SEEK_SET) == -1)
     {
         return -1;
     }
+#endif
 
-    while ((bytes_read = read(file_fd, buf, sizeof(buf))) > 0)
+    while ((bytes_read = read(data_fd, buf, sizeof(buf))) > 0)
     {
         ssize_t total_sent = 0;
         while (total_sent < bytes_read)
         {
-            ssize_t bytes_sent = send(sock_fd, buf + total_sent, bytes_read - total_sent, 0);
+            ssize_t bytes_sent = send(client_fd, buf + total_sent, bytes_read - total_sent, 0);
             if (bytes_sent < 0)
             {
                 if (errno == EINTR)
