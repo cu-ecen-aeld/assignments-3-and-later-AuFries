@@ -29,9 +29,16 @@ Via QEMU: ssh -p 10022 root@localhost
 #include <time.h>
 #include "queue.h"
 
+#define USE_AESD_CHAR_DEVICE 1
+
+#if USE_AESD_CHAR_DEVICE
+    #define DATA_PATH "/dev/aesdchar"
+#else 
+    #define DATA_PATH "/var/tmp/aesdsocketdata"
+#endif
+
 #define PORT "9000"
 #define BACKLOG 10
-#define DATA_PATH "/var/tmp/aesdsocketdata"
 #define RECEIVE_SIZE 4096
 #define SEND_SIZE 4096
 #define PACKET_DELIM_CH '\n'
@@ -141,7 +148,9 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
 
-    timestamp_timer_init(); // Starts writing timestamp to datafile
+    if (!USE_AESD_CHAR_DEVICE) {
+        timestamp_timer_init(); // Starts writing timestamp to datafile
+    }
 
     // Initialize thread linked list
     struct slisthead head = SLIST_HEAD_INITIALIZER(head);
@@ -162,7 +171,9 @@ int main(int argc, char *argv[])
 
     close(sock_fd);
     close(data_fd);
+#if !USE_AESD_CHAR_DEVICE
     remove(DATA_PATH);
+#endif
     closelog();
 
     return EXIT_SUCCESS;
