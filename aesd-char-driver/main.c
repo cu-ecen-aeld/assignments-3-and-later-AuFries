@@ -108,37 +108,98 @@ static ssize_t aesd_write(struct file *filp, const char __user *buf, size_t coun
 {
     ssize_t retval = -ENOMEM;
     char* buffptr = NULL;
+    char* new_pending = NULL;
+    char* newline = NULL;
     const char* replaced_buffptr = NULL;
+    size_t old_size, new_size;
+    size_t commit_size;
+    size_t remainder_size = 0;
     struct aesd_buffer_entry new_entry;
     struct aesd_dev *dev = filp->private_data;
 
     PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
 
+    // Grab mutex
     if (mutex_lock_interruptible(&dev->lock)) {
         return -ERESTARTSYS;
     }
 
+    // Allocate buffer for reading userspace data
     buffptr = kmalloc(count, GFP_KERNEL);
     if (!buffptr)
         goto out;
 
+    // Obtain userspace data and place in buffer
     if (copy_from_user(buffptr, buf, count)) {
         retval = -EFAULT;
         kfree(buffptr);
         goto out;
     }
 
-    new_entry.buffptr = buffptr;
-    new_entry.size = count;
+    // Update sizes based on pending writes
+    old_size = dev->pending_write_size;
+    new_size = old_size + count;
+
+    // Expand memory region based on new writes
+    new_pending = krealloc(dev->pending_write, new_size, GFP_KERNEL);
+    if(!new_pending) {
+        goto out;
+    }
+    dev->pending_write = new_pending;
+
+    // Append user data to the pending write
+    memcpy(dev->pending_write + old_size, buffptr, count);
+    dev->pending_write_size = new_size;
+
+    // Free unused buffer
+    kfree(buffptr);
+    buffptr = NULL;
+
+    // Check if a complete entry is received
+    newline = memchr(dev->pending_write, '\n', dev->pending_write_size);
+    if (!newline) {
+        retval = count;
+        goto out;
+    }
+
+    // Write entry through the newline
+    commit_size = (newline - dev->pending_write) + 1;
+
+    // Initialize new entry buffer
+    new_entry.buffptr = kmalloc(commit_size, GFP_KERNEL);
+    if (!new_entry.buffptr) {
+        goto out;
+    }
+    memcpy((char *)new_entry.buffptr, dev->pending_write, commit_size);
+    new_entry.size = commit_size;
 
     replaced_buffptr = aesd_circular_buffer_add_entry(&dev->circular_buffer, &new_entry);
     if (replaced_buffptr) {
         kfree(replaced_buffptr);
     }
 
+    // Save remainder after newline as part of next entry
+    remainder_size = dev->pending_write_size - commit_size;
+    if (remainder_size > 0) {
+        memmove(dev->pending_write, dev->pending_write + commit_size, remainder_size);
+
+        new_pending = krealloc(dev->pending_write, remainder_size, GFP_KERNEL);
+        // remainder_size of 0 is a free and non-NULL means the same or new pointer location
+        // if NULL occurs, keep using previously allocated larger memory region but update the logical size
+        if (new_pending || remainder_size == 0) { 
+            dev->pending_write = new_pending;  
+        }
+        dev->pending_write_size = remainder_size;
+    } else {
+        kfree(dev->pending_write);
+        dev->pending_write = NULL;
+        dev->pending_write_size = 0;
+    }
+
     retval = count;
 
   out:
+    kfree(buffptr);
     mutex_unlock(&dev->lock);
     return retval;
 }
@@ -203,6 +264,11 @@ static void aesd_cleanup_module(void)
         entry->buffptr = NULL;
         entry->size = 0;
     }
+
+    kfree(aesd_device.pending_write);
+    aesd_device.pending_write = NULL;
+    aesd_device.pending_write_size = 0;
+
     mutex_unlock(&aesd_device.lock);
 
     unregister_chrdev_region(devno, 1);

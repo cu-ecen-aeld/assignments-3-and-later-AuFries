@@ -30,6 +30,9 @@ struct aesd_dev
      struct aesd_circular_buffer circular_buffer; /* Circular buffer to store data */
      struct mutex lock;                           /* Mutual exclusion mutex */
      struct cdev cdev;                            /* Char device structure */
+
+     char *pending_write;
+     size_t pending_write_size;
 };
 
 #endif /* AESD_CHAR_DRIVER_AESDCHAR_H_ */
