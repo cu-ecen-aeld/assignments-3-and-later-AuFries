@@ -48,10 +48,58 @@ static ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
                 loff_t *f_pos)
 {
     ssize_t retval = 0;
+    struct aesd_dev *dev = filp->private_data;
+    struct aesd_buffer_entry *entry;
+    size_t entry_offset;
+    size_t bytes_to_copy;
+    size_t total_copied = 0;
+
     PDEBUG("read %zu bytes with offset %lld",count,*f_pos);
-    /**
-     * TODO: handle read
-     */
+
+    if (!buf || !f_pos) {
+        return -EINVAL;
+    }
+
+    if (*f_pos < 0) {
+        return -EINVAL;
+    }
+
+    if (count == 0) {
+        return 0;
+    }
+
+    if (mutex_lock_interruptible(&dev->lock)) {
+        return -ERESTARTSYS;
+    }
+
+
+    while (total_copied < count) {
+
+        /* Obtain entry and offset corresponsidng to current fpos */
+        entry = aesd_circular_buffer_find_entry_offset_for_fpos(&dev->circular_buffer, (size_t)(*f_pos), &entry_offset);
+
+        if (!entry) {
+            break;
+        }
+
+        /* Copy as much as possible from given entry. 
+           Either the rest of the entry or the amount requested by userspace */
+        bytes_to_copy = min(entry->size - entry_offset, count - total_copied);
+
+        /* Copy bytes to user buffer */
+        if (copy_to_user(buf + total_copied, entry->buffptr + entry_offset, bytes_to_copy)) {
+            retval = -EFAULT;
+            goto out;
+        }
+
+        total_copied += bytes_to_copy;
+        *f_pos += bytes_to_copy;
+    }
+
+    retval = total_copied;
+
+  out:
+    mutex_unlock(&dev->lock);
     return retval;
 }
 
@@ -62,10 +110,11 @@ static ssize_t aesd_write(struct file *filp, const char __user *buf, size_t coun
     char* buffptr = NULL;
     const char* replaced_buffptr = NULL;
     struct aesd_buffer_entry new_entry;
+    struct aesd_dev *dev = filp->private_data;
 
     PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
 
-    if (mutex_lock_interruptible(&aesd_device.lock)) {
+    if (mutex_lock_interruptible(&dev->lock)) {
         return -ERESTARTSYS;
     }
 
@@ -82,7 +131,7 @@ static ssize_t aesd_write(struct file *filp, const char __user *buf, size_t coun
     new_entry.buffptr = buffptr;
     new_entry.size = count;
 
-    replaced_buffptr = aesd_circular_buffer_add_entry(&aesd_device.circular_buffer, &new_entry);
+    replaced_buffptr = aesd_circular_buffer_add_entry(&dev->circular_buffer, &new_entry);
     if (replaced_buffptr) {
         kfree(replaced_buffptr);
     }
@@ -90,7 +139,7 @@ static ssize_t aesd_write(struct file *filp, const char __user *buf, size_t coun
     retval = count;
 
   out:
-    mutex_unlock(&aesd_device.lock);
+    mutex_unlock(&dev->lock);
     return retval;
 }
 
