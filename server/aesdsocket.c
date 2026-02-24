@@ -535,15 +535,14 @@ static int socket_send_file(int client_fd)
 {
     char buf[SEND_SIZE];
     ssize_t bytes_read = 0;
+    int read_fd;
 
-#if !USE_AESD_CHAR_DEVICE
-    if (lseek(data_fd, 0, SEEK_SET) == -1)
-    {
+    read_fd = open(DATA_PATH, O_RDONLY);
+    if (read_fd < 0) {
         return -1;
     }
-#endif
 
-    while ((bytes_read = read(data_fd, buf, sizeof(buf))) > 0)
+    while ((bytes_read = read(read_fd, buf, sizeof(buf))) > 0)
     {
         ssize_t total_sent = 0;
         while (total_sent < bytes_read)
@@ -551,18 +550,20 @@ static int socket_send_file(int client_fd)
             ssize_t bytes_sent = send(client_fd, buf + total_sent, bytes_read - total_sent, 0);
             if (bytes_sent < 0)
             {
-                if (errno == EINTR)
-                    continue;
+                if (errno == EINTR) continue;
+                close(read_fd);
                 return -1;
             }
             total_sent += bytes_sent;
         }
     }
 
-    if (bytes_read == -1)
-    {
+    if (bytes_read < 0) {
+        close(read_fd);
         return -1;
     }
+
+    close(read_fd);
     return 0;
 }
 
